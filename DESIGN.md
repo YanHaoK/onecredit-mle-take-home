@@ -10,23 +10,28 @@ queries need one consistent database snapshot.
 
 ## Ingestion and correctness
 
-- The worker trims and uppercases registration numbers for identity. It preserves display fields and stores a separate
-  trimmed, case-folded industry key for comparisons. Null and whitespace-only descriptions are valid. The latest
-  company remains stored, and the transaction removes any previous vector.
-- A timezone-aware `updatedAt` is the source version. The worker checks the current version before inference to
-  skip known replays. PostgreSQL repeats the ordering check atomically in a conditional upsert. Only the transaction
-  that accepts a version changes its vector. A deferred foreign key enforces that the vector references the matching
-  source version. Inference runs outside the write transaction.
-- The first committed payload wins when timestamps tie. Identical events are duplicates. Conflicting equal-timestamp
-  payloads are logged. Delivery order can determine the winner in that case.
-- Manual acknowledgment follows a successful commit or a successful read that identifies a stale or duplicate
-  delivery. A crash before commit leaves the message available for redelivery. A crash after commit and before ACK
-  also permits redelivery, which the version check treats as a no-op.
+- **Data normalization:** Registration numbers are trimmed and uppercased to identify companies consistently. Records with missing descriptions are retained, but any existing embedding is removed to prevent stale recommendations.
+- **Out-of-order updates:** The source `updatedAt` timestamp determines which version of a company is accepted. The worker checks for stale or duplicate events before generating embeddings, while PostgreSQL enforces the version check atomically to prevent older updates from overwriting newer records.
+- **Data consistency:** Company records and their embeddings are updated within the same transaction, ensuring they remain consistent. Embedding inference runs outside the transaction to avoid holding database resources during computation.
+- **Duplicate handling:** Events with identical timestamps and content are treated as duplicates. When timestamps match but payloads conflict, the first committed version takes precedence and the conflict is logged.
 
-## Data quality in the supplied feed
 
-The audit replayed 2,518 deliveries in file order using the worker's validation and latest-version rules.
-Company counts below refer to the 2,000 latest accepted records.
+## Optional deep dive — registry data quality and late-arriving updates
+
+Thirty deliveries had a numeric `updatedAt`. Interpreting those numbers as Unix milliseconds would advance
+29 stored timestamps. All 30 had the same name, description, industry and state as the retained record.
+The timestamp still matters because the worker uses it to decide which future updates to accept. Guessing
+the unit could cause a genuine change to be discarded as stale. The worker therefore keeps these deliveries
+in `company-events.dlq` with their original payload and rejection reason. If the registry confirms the unit,
+they can be replayed through the existing version check once the parser supports milliseconds.
+
+Of the other 21 deliveries rejected for timestamps, 14 omitted the time zone and seven omitted `updatedAt`
+entirely. For example, `2026-08-14T09:06:19` in Malaysia and the same clock time in UTC are eight hours apart.
+Replay requires the registry to confirm the intended zone or supply the missing source timestamp.
+Using delivery time could let an older update overwrite a newer record.
+
+The audit replayed all 2,518 deliveries in file order. The table summarizes what happened under the worker's
+validation and version rules. Company counts refer to the 2,000 latest accepted records.
 
 | Finding | How the service handles it |
 |---|---|
@@ -42,110 +47,41 @@ stored record and embedding. The feed contains eight struck-off events that arri
 timestamps than the last accepted upserts. All eight companies therefore keep their existing embeddings
 and remain eligible for recommendations. The portal's eligibility policy can be revisited with the registry.
 
-**Timestamp decision.** Accept ISO timestamps with an explicit time zone. Quarantine numeric timestamps in
-`company-events.dlq` with the original payload and rejection reason. The source timestamp determines which
-update wins, so guessing the unit could cause a later valid update to be discarded as stale.
-
-Of the 51 deliveries rejected for timestamps, 30 contained numbers consistent with Unix milliseconds.
-Interpreted as milliseconds, 29 would advance the stored timestamp. All 30 carried the same name, description,
-industry and state as the retained record. If the registry confirms milliseconds, add explicit support for
-that unit and replay the quarantined events through the existing version check.
-
-The other 21 deliveries also stay in quarantine.
-
-- **14 omitted the time zone.** For example, `2026-08-14T09:06:19` could mean 9:06 AM in Malaysia or
-  9:06 AM UTC, eight hours apart. If the registry confirms the intended zone, apply it before replaying.
-- **7 omitted `updatedAt` entirely.** These need a source timestamp from the registry before replay.
-  Using delivery time could let a late-arriving, older update overwrite a newer record.
-
 **Open location finding.** State capitalization varies for 313 records. The API preserves these spellings.
 Some descriptions mention a city in a different state from the state field. Registered address and operating
 location can differ, so the feed alone does not justify a correction.
 
 ## Model and ranking
 
-The worker runs the MIT-licensed `intfloat/multilingual-e5-small` ONNX export on CPU, pinned to revision
-`614241f622f53c4eeff9890bdc4f31cfecc418b3`. Each input is the cleaned and trimmed business description with the E5
-`query: ` prefix. The worker truncates to 512 tokens, mean-pools using the attention mask, and L2-normalizes the
-384-dimensional vector. It stores the revision and preprocessing identifier with each embedding. The same pipeline
-handles English and Malay. Both languages passed an inference smoke test on Python 3.14. Recommendation quality
-across languages remains unmeasured. [Model card](https://huggingface.co/intfloat/multilingual-e5-small)
+The service uses the MIT-licensed intfloat/multilingual-e5-small model with ONNX Runtime for CPU inference. I chose a multilingual model to support both English and Malay business descriptions without translation. Each description is converted into a 384-dimensional embedding, with model and preprocessing versions stored to maintain consistency.
 
-PostgreSQL computes exact cosine similarity for all eligible vectors before applying the limit. It excludes the
-source company and uses only current vectors from the configured model. A same-industry match adds the configurable
-`INDUSTRY_BONUS` (default `0.05`). Industry is a soft signal because categories are broad and closely related
-businesses can span sectors. Embedding the description alone keeps industry from contributing twice. Name and state
-are display fields. The API returns cosine similarity and the adjusted ranking score separately. The adjusted score
-can exceed 1.
+Recommendations are ranked using exact cosine similarity in PostgreSQL, with a configurable same-industry bonus (default 0.05). Only the business description is embedded, while industry acts as an additional ranking signal. This allows companies with similar business activities to rank highly even when they belong to different industries.
 
-Semantic cards sort by ranking score descending, cosine similarity descending, then registration number ascending.
-Any remaining slots are filled from the same known industry in registration-number order, skipping cards already
-selected. Fallback also works when the source company has no eligible vector. Both scores are null on fallback cards.
-A company with neither a usable vector nor a known industry stays stored but may have no recommendations and may
-never appear as a candidate. At roughly 2,000 companies, exact scoring keeps the weighted ordering straightforward.
-The implementation uses no approximate vector index.
+When there are insufficient semantic matches, the service fills the remaining recommendations with companies from the same industry. Companies without usable descriptions can still receive industry-based recommendations. Given the dataset size of approximately 2,000 companies, I chose exact vector search over approximate indexing to keep the ranking logic simple.
 
 ## Delivery and service operation
 
-The consumer declares the registry-owned `company-events` queue as durable with its original arguments and
-prefetches one delivery. Transaction conflicts retry up to three attempts with backoff. Connection failures
-trigger reconnection with capped exponential backoff. Exhausted transaction retries, inference failures and
-unexpected SQL errors stop the worker with its delivery pending for restart after repair.
-The local database connection and statement timeouts are five seconds.
+The RabbitMQ consumer uses manual acknowledgments to avoid losing messages before processing completes. Transient failures are retried, while persistent processing failures stop the worker and leave the message unacknowledged for recovery after the issue is resolved.
 
-Malformed and unsupported events go to the durable `company-events.dlq` queue with the original body,
-message ID, and reason. The worker ACKs the original only after RabbitMQ confirms quarantine publication. A crash between
-quarantine confirmation and ACK can create duplicate quarantine messages. Recovery from quarantine requires manual
-inspection and replay. Compose named volumes retain broker and database state across container recreation.
-`just down` removes both volumes.
+Malformed or unsupported events are sent to a durable dead-letter queue (company-events.dlq) for manual review instead of being retried indefinitely. The original message is acknowledged only after RabbitMQ confirms successful publication to the DLQ.
 
-`GET /healthz` reports process liveness. `GET /companies/SYN-001777/similar?limit=5` returns the canonical query
-ID, ranking method, applied bonus, and recommendation cards. Each card supplies registration number, name, industry,
-state, description, match type, and both scores. `ranking=cosine` sets the bonus to zero for the request. For example,
-an unknown registration returns HTTP 404 with this body.
-
-```json
-{"detail":{"code":"COMPANY_NOT_FOUND","message":"Company not found"}}
-```
-
-Invalid limits or ranking values return HTTP 422. Temporary database failures return HTTP 503 with
-`SERVICE_UNAVAILABLE`. A known company without any matches returns HTTP 200 with an empty array.
-The API pool holds up to five connections, bounds waiting requests, checks connections on checkout, allows two
-seconds for pool acquisition, and sets a five-second statement timeout. Logs report consumer outcomes and retries,
-API query duration, and error classes. Client error bodies omit credentials and internal errors.
+The FastAPI service exposes GET /companies/{registration_number}/similar for recommendations and GET /healthz for liveness checks. It returns HTTP 404 for unknown companies, HTTP 200 with an empty list when no recommendations are available, and HTTP 503 for temporary database failures. Database connections and query timeouts are bounded to prevent resource exhaustion.
 
 ## Verification
 
-- The complete `uv run --locked python -m unittest discover -s tests -v` suite ran with `ONECREDIT_TEST_DATABASE_URL` pointed
-  at an isolated PostgreSQL 16 instance with pgvector 0.8.7. All 13 tests passed. The tests exercised validation,
-  ranking and fallback, concurrent version writes, rollback, and a simulated ACK failure after a real commit.
-- Final verification installed the locked dependencies in a fresh Python environment and started Compose with
-  empty volumes. A two-message fixture published with the supplied producer went through the worker and the running
-  HTTP API. Two identical descriptions produced a cosine score of 1 within numerical tolerance. The smoke run
-  reused previously downloaded model files. The RabbitMQ health check runs as the broker user so it can share
-  the Erlang cookie on first startup.
-- The supplied producer fed 2,518 deliveries into a fresh RabbitMQ queue. The worker stored 2,000 companies and
-  1,961 embeddings with matching source versions, and quarantined 89 malformed deliveries. The second publish
-  preserved the company and embedding rows and the live API response, and quarantined the same 89 messages again.
-  The default five cards for `SYN-001777` were `SYN-000036`, `SYN-000040`, `SYN-000157`, `SYN-000172`,
-  and `SYN-000284`.
-- A newer null description removed the vector and the API returned same-industry cards with null scores. An older
-  delivery left that state intact. A live PostgreSQL outage returned HTTP 503, and the API and worker recovered
-  after restart. The same worker reconnected after a RabbitMQ restart. A queued event and a quarantine message
-  survived RabbitMQ container recreation, and a restarted worker processed the queued event.
+- **Automated tests:** All 13 tests passed, covering event validation, recommendation ranking, concurrent updates, transaction rollback, and message acknowledgment behavior.
+
+- **End-to-end ingestion:** Processed 2,518 events from the supplied producer, resulting in 2,000 companies, 1,961 embeddings, and 89 quarantined events. Replaying the dataset did not change the stored company or embedding records.
+
+- **Failure recovery:** Verified that stale updates cannot overwrite newer records, missing descriptions remove existing embeddings, and the service handles PostgreSQL and RabbitMQ outages. Queued messages and quarantined events also survived broker container recreation.
 
 ## At 10× volume
 
-Measure queue lag, inference throughput, and API p50/p95 latency with representative data first. If inference
-limits throughput, batch encodes or add worker processes while retaining the conditional write and bounded database
-connections. Size the API pool against database capacity and track pool wait time, retries, lag, and quarantine
-growth. If exact query latency becomes a problem, evaluate HNSW candidate retrieval against exact weighted top-K
-recall, with particular attention to candidates that the industry bonus lifts into the top results. For a model
-change, build a versioned replacement set of vectors and switch the active version once coverage and quality have
-been verified.
+With 20,000 companies, I would keep exact cosine similarity search unless API latency becomes a problem. The dataset is still relatively small, and exact search avoids the additional complexity of approximate vector indexes.
 
-The implementation leaves relevance labeling, bonus tuning, latency benchmarking, and the optional company
-metadata endpoint for future work. No benchmark or ranking-quality result is claimed.
+For a continuously higher incoming event rate, I would first measure consumer throughput and RabbitMQ queue growth. If embedding inference becomes the bottleneck, I would run multiple consumers to process messages in parallel. The existing timestamp-based conditional upsert protects against older updates overwriting newer ones, even when messages are processed out of order.
+
+I would monitor CPU usage, database connections, and API latency before making further changes.
 
 ## AI disclosure
 

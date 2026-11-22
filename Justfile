@@ -17,3 +17,15 @@ down:
 # Replay the registry feed onto the company-events queue.
 publish:
     uv run python -m producer.publish
+
+# Process queued company events.
+worker:
+    uv run --locked python -m app.consumer
+
+# Serve company recommendations.
+api:
+    uv run --locked uvicorn app.api:app
+
+# Stop the services and keep the local data.
+stop:
+    docker compose down

@@ -10,6 +10,60 @@ pgvector.
 
 Assessment version: **2026.11** (`mle-v2026.11`). What changed between versions is in [`CHANGELOG.md`](CHANGELOG.md).
 
+## Run locally
+
+Install Git, [Docker with Compose](https://docs.docker.com/get-started/get-docker/), [just](https://just.systems/man/en/installation.html), and [uv](https://docs.astral.sh/uv/getting-started/installation/). On Windows, run the commands in Git Bash. Start Docker. The first run needs internet access for Python 3.14, dependencies, container images, and the embedding model.
+
+**1. Terminal 1 — clone the project.** If you already have a checkout, open it in your terminal and skip this block.
+
+```sh
+git clone https://github.com/YanHaoK/onecredit-mle-take-home.git
+cd onecredit-mle-take-home
+```
+
+**2. Terminal 1 — install dependencies and start Postgres and RabbitMQ.** Wait for both services to become healthy and the prompt to return.
+
+```sh
+just setup
+just up
+```
+
+**3. Terminal 2 — start the consumer.** Open a second terminal in the same project folder and leave the worker running. It downloads the embedding model on its first run.
+
+```sh
+just worker
+```
+
+**4. Back in terminal 1 — publish the sample feed.** When the producer finishes, it prints `published 2518 messages to company-events`. The worker in terminal 2 processes those messages.
+
+```sh
+just publish
+```
+
+**5. Terminal 3 — start the API.** Open a third terminal in the same project folder and leave the API running.
+
+```sh
+just api
+```
+
+**6. Try a recommendation.** Once Uvicorn starts, open [similar companies for SYN-001777](http://127.0.0.1:8000/companies/SYN-001777/similar?limit=5) in your browser. You should see JSON with a `recommendations` list. If you get a 404 while the worker loads the feed, wait a moment and refresh.
+
+**Shut down.** Press Ctrl+C in terminals 2 and 3 to stop the worker and API. In terminal 1, choose one of the following commands.
+
+**For a clean shutdown and reset**, run this to delete the local Postgres data and RabbitMQ queues. On your next run, repeat steps 2 through 5 to reload the sample feed.
+
+```sh
+just down
+```
+
+**If you want to keep your data**, run this instead.
+
+```sh
+just stop
+```
+
+After `just stop`, resume with `just up` in terminal 1, `just worker` in terminal 2, and `just api` in terminal 3. You can skip publishing because the data is still there.
+
 ## The scenario
 
 When someone opens a company's page on the OneCredit portal, we want to show a **"Similar companies"** panel next to
@@ -117,64 +171,14 @@ Use an open-source embedding model that runs on a laptop CPU. Don't call a paid 
   [fastembed](https://qdrant.github.io/fastembed/) or sentence-transformers. The panel in the mock above comes from it.
 - A placeholder while you build, such as a hashed bag-of-words vector, as long as you say so in `DESIGN.md`.
 
-## Getting started
+## Local configuration
 
-You need Docker and [uv](https://docs.astral.sh/uv/) (it installs Python 3.14 for you).
-[Just](https://github.com/casey/just) provides shortcuts for the commands below.
+- **Ports.** Set `POSTGRES_PORT`, `RABBITMQ_PORT`, or `RABBITMQ_UI_PORT` in both terminals before startup to override the defaults. The default database URL is `postgresql://postgres:postgres@localhost:5432/companies`. The [RabbitMQ management UI](http://localhost:15672) uses `guest` for both username and password. Explicit `DATABASE_URL` and `RABBITMQ_URL` settings take precedence for the Python services that use them.
+- **Model cache.** The worker reuses the downloaded multilingual E5 model. Set `HF_HOME` to choose the cache location or `HF_HUB_OFFLINE=1` to use a populated cache offline.
+- **Existing databases.** Compose initializes the schema on an empty Postgres volume. For an existing database, apply [the schema](sql/001_init.sql) with `psql` before starting the worker.
+- **Full reset.** To rebuild old embeddings after the description cleanup, stop the worker and API, then run `just down`. **This deletes the local database and RabbitMQ queues, including quarantined messages.** Repeat steps 2 through 5 to rebuild from the feed. Replaying alone skips previously accepted versions and quarantines malformed deliveries again.
 
-```bash
-just setup      # install the project dependencies
-just up         # start Postgres (with pgvector) and RabbitMQ
-just publish    # publish the registry feed to the queue
-just down       # stop everything and delete the data
-```
-
-Without `just`, the equivalent commands are `uv sync --locked`, `docker compose up -d --wait`,
-`uv run python -m producer.publish`, and `docker compose down -v`, respectively.
-
-Postgres is at `postgresql://postgres:postgres@localhost:5432/companies`, and the RabbitMQ management UI is at
-http://localhost:15672 (user `guest`, password `guest`). If those ports are taken on your machine, export
-`POSTGRES_PORT`, `RABBITMQ_PORT` or `RABBITMQ_UI_PORT` in your shell before `just up`; `just publish` uses the same
-`RABBITMQ_PORT`.
-
-`just publish` sends the whole feed every time you run it. To start again from an empty queue and database, run
-`just down` and then `just up`.
-
-## Run the ingestion worker
-
-**Rebuilding existing take-home data after the description cleanup.** Stop the worker and API, then run
-`just down` and `just up`. This deletes the local PostgreSQL and RabbitMQ volumes, including quarantined
-messages, and initializes a fresh schema. Start the worker as shown below, run `just publish` to rebuild
-from `data/feed.jsonl`, then start the API. A container restart alone keeps the old volumes. Publishing
-over an existing database skips previously accepted versions, so it cannot refresh their embeddings.
-Fresh checkouts can start with the normal setup below.
-
-After `just setup` and `just up`, start the worker in a separate terminal:
-
-```bash
-uv run --locked python -m app.consumer
-```
-
-Run `just publish` to send the feed. The worker downloads the pinned multilingual E5 model on its first start and
-reuses the Hugging Face cache on subsequent starts. Once cached, set `HF_HUB_OFFLINE=1` to run without network
-access to the model registry. You can set `HF_HOME` to choose the cache location.
-
-The worker uses the same `POSTGRES_PORT` and `RABBITMQ_PORT` overrides as Compose. `DATABASE_URL` and
-`RABBITMQ_URL` take precedence when set. Compose initializes pgvector and the schema on an empty PostgreSQL
-volume. For an existing local database, apply `sql/001_init.sql` with `psql` before starting the worker.
-
-Valid deliveries update the company and its embedding in one transaction. Malformed deliveries are published to
-`company-events.dlq`, and replay quarantines them again. PostgreSQL and RabbitMQ data survive container recreation
-with their named volumes. `just down` removes those volumes.
-
-## Run the recommendation API
-
-With PostgreSQL running, start the API in a separate terminal:
-
-```bash
-uv run --locked uvicorn app.api:app
-curl "http://127.0.0.1:8000/companies/SYN-001777/similar?limit=5"
-```
+## Recommendation API
 
 `GET /healthz` reports process liveness. The recommendation route accepts limits from 1 to 20 and returns
 semantic matches first. It adds an industry bonus of 0.05 by default. Set `INDUSTRY_BONUS` before starting
@@ -206,7 +210,7 @@ and the restarted worker drained the source queue. See [DESIGN.md](DESIGN.md) fo
 ├── data/feed.jsonl        # the registry feed: 2,518 messages about 2,000 synthetic Malaysian companies, duplicates included
 ├── producer/publish.py    # replays the feed onto the queue
 ├── docker-compose.yml     # Postgres with pgvector, and RabbitMQ
-└── Justfile               # setup, up, publish, down
+└── Justfile               # local setup, worker, API, and shutdown commands
 ```
 
 Add whatever else you need (`uv add` for libraries).

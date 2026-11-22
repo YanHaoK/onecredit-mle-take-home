@@ -142,6 +142,13 @@ http://localhost:15672 (user `guest`, password `guest`). If those ports are take
 
 ## Run the ingestion worker
 
+**Rebuilding existing take-home data after the description cleanup.** Stop the worker and API, then run
+`just down` and `just up`. This deletes the local PostgreSQL and RabbitMQ volumes, including quarantined
+messages, and initializes a fresh schema. Start the worker as shown below, run `just publish` to rebuild
+from `data/feed.jsonl`, then start the API. A container restart alone keeps the old volumes. Publishing
+over an existing database skips previously accepted versions, so it cannot refresh their embeddings.
+Fresh checkouts can start with the normal setup below.
+
 After `just setup` and `just up`, start the worker in a separate terminal:
 
 ```bash

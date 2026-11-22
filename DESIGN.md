@@ -23,10 +23,49 @@ queries need one consistent database snapshot.
   delivery. A crash before commit leaves the message available for redelivery. A crash after commit and before ACK
   also permits redelivery, which the version check treats as a no-op.
 
+## Data quality in the supplied feed
+
+The audit replayed 2,518 deliveries in file order using the worker's validation and latest-version rules.
+Company counts below refer to the 2,000 latest accepted records.
+
+| Finding | How the service handles it |
+|---|---|
+| Seven descriptions repeat a phrase 60 times, including the oil-palm description for `SYN-000300`. | Preserve the registry text in PostgreSQL. For embeddings and recommendation cards, collapse a multiword phrase to one copy when at least three exact copies cover the entire description. Compare case-sensitive words across whitespace. Keep additional details and partial repetitions. Rebuilding from the supplied feed applies this rule to every stored vector. |
+| 24 descriptions are null and 15 are empty. Industry is missing for 102 companies and state for 49. | Keep the company. A missing description clears its vector. A known industry provides fallback cards. Missing state stays null. Four companies lack both description and industry, leaving them with no way to receive or appear in recommendations. |
+| 49 valid deliveries had registration-number formatting variants. In delivery order, 63 valid events duplicated the current version and 66 were stale. | Trim and uppercase the ID. Update the stored company only when the source timestamp is newer. |
+| 30 names each appear under two registration numbers, and one name appears under three. Among 1,961 companies with usable descriptions there are 169 distinct cleaned texts. | Keep each registration number as a separate company, even when names or business descriptions match. |
+| 89 deliveries failed validation. | Quarantine the original delivery with its reason. The first reported failures were 51 timestamps, 10 registration numbers, nine data objects, five invalid JSON bodies, six null envelopes, and eight unsupported struck-off events. |
+
+**Company status decision.** For this take-home, the worker quarantines every `company-struck-off` event in
+`company-events.dlq` for manual review. Only an accepted `company-upserted` event updates a company's
+stored record and embedding. The feed contains eight struck-off events that arrived with newer source
+timestamps than the last accepted upserts. All eight companies therefore keep their existing embeddings
+and remain eligible for recommendations. The portal's eligibility policy can be revisited with the registry.
+
+**Timestamp decision.** Accept ISO timestamps with an explicit time zone. Quarantine numeric timestamps in
+`company-events.dlq` with the original payload and rejection reason. The source timestamp determines which
+update wins, so guessing the unit could cause a later valid update to be discarded as stale.
+
+Of the 51 deliveries rejected for timestamps, 30 contained numbers consistent with Unix milliseconds.
+Interpreted as milliseconds, 29 would advance the stored timestamp. All 30 carried the same name, description,
+industry and state as the retained record. If the registry confirms milliseconds, add explicit support for
+that unit and replay the quarantined events through the existing version check.
+
+The other 21 deliveries also stay in quarantine.
+
+- **14 omitted the time zone.** For example, `2026-08-14T09:06:19` could mean 9:06 AM in Malaysia or
+  9:06 AM UTC, eight hours apart. If the registry confirms the intended zone, apply it before replaying.
+- **7 omitted `updatedAt` entirely.** These need a source timestamp from the registry before replay.
+  Using delivery time could let a late-arriving, older update overwrite a newer record.
+
+**Open location finding.** State capitalization varies for 313 records. The API preserves these spellings.
+Some descriptions mention a city in a different state from the state field. Registered address and operating
+location can differ, so the feed alone does not justify a correction.
+
 ## Model and ranking
 
 The worker runs the MIT-licensed `intfloat/multilingual-e5-small` ONNX export on CPU, pinned to revision
-`614241f622f53c4eeff9890bdc4f31cfecc418b3`. Each input is the trimmed business description with the E5
+`614241f622f53c4eeff9890bdc4f31cfecc418b3`. Each input is the cleaned and trimmed business description with the E5
 `query: ` prefix. The worker truncates to 512 tokens, mean-pools using the attention mask, and L2-normalizes the
 384-dimensional vector. It stores the revision and preprocessing identifier with each embedding. The same pipeline
 handles English and Malay. Both languages passed an inference smoke test on Python 3.14. Recommendation quality
@@ -49,13 +88,13 @@ The implementation uses no approximate vector index.
 ## Delivery and service operation
 
 The consumer declares the registry-owned `company-events` queue as durable with its original arguments and
-prefetches one delivery. Database operations retry up to three attempts with backoff. After persistent database
-failure, the worker closes the broker connection so pending deliveries can be redelivered, then reconnects with
-capped exponential backoff. The local database connection and statement timeouts are five seconds.
+prefetches one delivery. Transaction conflicts retry up to three attempts with backoff. Connection failures
+trigger reconnection with capped exponential backoff. Exhausted transaction retries, inference failures and
+unexpected SQL errors stop the worker with its delivery pending for restart after repair.
+The local database connection and statement timeouts are five seconds.
 
-Malformed events and per-delivery inference failures that exhaust retries go to the durable
-`company-events.dlq` queue with the original body, message ID, and reason. Inference failures also carry model
-provenance. The worker ACKs the original only after RabbitMQ confirms quarantine publication. A crash between
+Malformed and unsupported events go to the durable `company-events.dlq` queue with the original body,
+message ID, and reason. The worker ACKs the original only after RabbitMQ confirms quarantine publication. A crash between
 quarantine confirmation and ACK can create duplicate quarantine messages. Recovery from quarantine requires manual
 inspection and replay. Compose named volumes retain broker and database state across container recreation.
 `just down` removes both volumes.

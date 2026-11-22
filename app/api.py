@@ -9,10 +9,10 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from psycopg import Error as DatabaseError, OperationalError
 from psycopg.errors import QueryCanceled
 from psycopg_pool import ConnectionPool
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from app.config import Settings, read_industry_bonus
-from app.events import registration_key
+from app.events import display_description, registration_key
 from app.recommendations import find_similar
 
 log = logging.getLogger("uvicorn.error")
@@ -27,6 +27,8 @@ class Recommendation(BaseModel):
     match_type: Literal["semantic", "same_industry"]
     cosine_similarity: float | None
     ranking_score: float | None
+
+    normalize_description = field_validator("nature_of_business")(display_description)
 
 
 class SimilarCompanies(BaseModel):

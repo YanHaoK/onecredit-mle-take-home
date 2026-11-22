@@ -32,20 +32,35 @@ Company counts below refer to the 2,000 latest accepted records.
 |---|---|
 | Seven descriptions repeat a phrase 60 times, including the oil-palm description for `SYN-000300`. | Preserve the registry text in PostgreSQL. For embeddings and recommendation cards, collapse a multiword phrase to one copy when at least three exact copies cover the entire description. Compare case-sensitive words across whitespace. Keep additional details and partial repetitions. Rebuilding from the supplied feed applies this rule to every stored vector. |
 | 24 descriptions are null and 15 are empty. Industry is missing for 102 companies and state for 49. | Keep the company. A missing description clears its vector. A known industry provides fallback cards. Missing state stays null. Four companies lack both description and industry, leaving them with no way to receive or appear in recommendations. |
-| 49 valid deliveries had registration-number formatting variants. In delivery order, 63 valid events duplicated the current version and 66 were stale. | Trim and uppercase the ID and condition writes on a newer source timestamp. Companies with different IDs stay separate, including 63 companies sharing 31 names. The 1,961 usable descriptions reduce to 169 distinct cleaned texts. |
+| 49 valid deliveries had registration-number formatting variants. In delivery order, 63 valid events duplicated the current version and 66 were stale. | Trim and uppercase the ID. Update the stored company only when the source timestamp is newer. |
+| 30 names each appear under two registration numbers, and one name appears under three. Among 1,961 companies with usable descriptions there are 169 distinct cleaned texts. | Keep each registration number as a separate company, even when names or business descriptions match. |
 | 89 deliveries failed validation. | Quarantine the original delivery with its reason. The first reported failures were 51 timestamps, 10 registration numbers, nine data objects, five invalid JSON bodies, six null envelopes, and eight unsupported struck-off events. |
 
-Three open findings affect interpretation of the data:
+**Company status decision.** For this take-home, the worker quarantines every `company-struck-off` event in
+`company-events.dlq` for manual review. Only an accepted `company-upserted` event updates a company's
+stored record and embedding. The feed contains eight struck-off events that arrived with newer source
+timestamps than the last accepted upserts. All eight companies therefore keep their existing embeddings
+and remain eligible for recommendations. The portal's eligibility policy can be revisited with the registry.
 
-- **Company status.** Eight `company-struck-off` events are newer than the companies' last accepted upserts.
-  All eight already have usable descriptions. Their prior embeddings and recommendation eligibility survive the
-  quarantined status event. Confirm portal eligibility with the registry before implementing status handling.
-- **Timestamp formats.** Thirty of the 51 rejected timestamps look like Unix milliseconds. Under that
-  interpretation, 29 would advance the stored timestamp. All 30 carry the same name, description, industry
-  and state as the retained record. The worker requires timezone-aware ISO timestamps until the unit is confirmed.
-- **Location.** State capitalization varies for 313 records. The API preserves these spellings. Some descriptions
-  mention a city in a different state from the state field. Registered address and operating location can differ,
-  so the feed alone does not justify a correction.
+**Timestamp decision.** Accept ISO timestamps with an explicit time zone. Quarantine numeric timestamps in
+`company-events.dlq` with the original payload and rejection reason. The source timestamp determines which
+update wins, so guessing the unit could cause a later valid update to be discarded as stale.
+
+Of the 51 deliveries rejected for timestamps, 30 contained numbers consistent with Unix milliseconds.
+Interpreted as milliseconds, 29 would advance the stored timestamp. All 30 carried the same name, description,
+industry and state as the retained record. If the registry confirms milliseconds, add explicit support for
+that unit and replay the quarantined events through the existing version check.
+
+The other 21 deliveries also stay in quarantine.
+
+- **14 omitted the time zone.** For example, `2026-08-14T09:06:19` could mean 9:06 AM in Malaysia or
+  9:06 AM UTC, eight hours apart. If the registry confirms the intended zone, apply it before replaying.
+- **7 omitted `updatedAt` entirely.** These need a source timestamp from the registry before replay.
+  Using delivery time could let a late-arriving, older update overwrite a newer record.
+
+**Open location finding.** State capitalization varies for 313 records. The API preserves these spellings.
+Some descriptions mention a city in a different state from the state field. Registered address and operating
+location can differ, so the feed alone does not justify a correction.
 
 ## Model and ranking
 

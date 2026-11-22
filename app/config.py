@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 MODEL_REPO = "intfloat/multilingual-e5-small"
 MODEL_REVISION = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
-MODEL_NAME = f"{MODEL_REPO}@{MODEL_REVISION}:onnx-query-mean-l2:collapse-repeats-v1"
+MODEL_NAME = f"{MODEL_REPO}@{MODEL_REVISION}:onnx-query-mean-l2"
 
 
 @dataclass(frozen=True)

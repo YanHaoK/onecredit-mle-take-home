@@ -2,12 +2,12 @@ import asyncio
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from pamqp.commands import Basic
-from psycopg import OperationalError
+from psycopg import errors
 
-from app.consumer import process_delivery
+from app.consumer import consume, process_delivery
 
 VALID_BODY = (Path(__file__).resolve().parents[1] / "data" / "feed.jsonl").read_bytes().splitlines()[0]
 
@@ -44,15 +44,86 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             await task
         self.message.ack.assert_awaited_once()
 
-    async def test_database_failure_retries_without_ack_or_quarantine(self):
+    async def test_transaction_conflicts_retry_then_ack(self):
+        with (
+            patch("app.consumer.existing_outcome", side_effect=[errors.SerializationFailure, None]) as read,
+            patch("app.consumer.store_event", side_effect=[errors.DeadlockDetected, "applied"]) as write,
+            patch("app.consumer.asyncio.sleep"),
+        ):
+            await self.process()
+        self.assertEqual(read.await_count, 2)
+        self.assertEqual(write.await_count, 2)
+        self.embedder.encode.assert_called_once()
+        self.message.ack.assert_awaited_once()
+
+    async def test_exhausted_lock_retries_leave_delivery_unacknowledged(self):
         with (
             patch("app.consumer.existing_outcome", return_value=None),
-            patch("app.consumer.store_event", side_effect=OperationalError) as write,
+            patch("app.consumer.store_event", side_effect=errors.LockNotAvailable) as write,
             patch("app.consumer.asyncio.sleep"),
-            self.assertRaises(OperationalError),
+            self.assertRaises(errors.LockNotAvailable),
         ):
             await self.process()
         self.assertEqual(write.await_count, 3)
+        self.message.ack.assert_not_awaited()
+        self.exchange.publish.assert_not_awaited()
+
+    async def run_worker(self, db_connect):
+        broker = AsyncMock()
+        channel = broker.channel.return_value
+        channel.default_exchange = self.exchange
+        source = channel.declare_queue.return_value
+        source.iterator = MagicMock()
+        deliveries = source.iterator.return_value.__aenter__.return_value
+        deliveries.__aiter__.return_value = [self.message]
+        broker.__aenter__.return_value = broker
+        with (
+            patch("app.consumer.connect", db_connect),
+            patch("app.consumer.aio_pika.connect", return_value=broker),
+        ):
+            await consume(Mock(), self.embedder)
+
+    async def test_inference_io_error_stops_worker_with_delivery_pending(self):
+        failure = ConnectionError("model runtime failed")
+        self.embedder.encode.side_effect = failure
+        connect = AsyncMock(side_effect=[AsyncMock(), AssertionError("unexpected reconnect")])
+        with (
+            patch("app.consumer.existing_outcome", return_value=None),
+            patch("app.consumer.store_event") as write,
+            self.assertRaisesRegex(RuntimeError, "message_id=test model=") as raised,
+        ):
+            await self.run_worker(connect)
+        self.assertIs(raised.exception.__cause__, failure)
+        write.assert_not_awaited()
+        self.message.ack.assert_not_awaited()
+        self.exchange.publish.assert_not_awaited()
+
+    async def test_schema_error_stops_worker_without_retries(self):
+        connect = AsyncMock(side_effect=[AsyncMock(), AssertionError("unexpected reconnect")])
+        with (
+            patch("app.consumer.existing_outcome", return_value=None),
+            patch("app.consumer.store_event", side_effect=errors.UndefinedColumn) as write,
+            patch("app.consumer.asyncio.sleep") as sleep,
+            self.assertRaises(errors.UndefinedColumn),
+        ):
+            await self.run_worker(connect)
+        connect.assert_awaited_once()
+        write.assert_awaited_once()
+        sleep.assert_not_awaited()
+        self.message.ack.assert_not_awaited()
+        self.exchange.publish.assert_not_awaited()
+
+    async def test_lost_connection_reopens_session_after_backoff(self):
+        connect = AsyncMock(side_effect=[AsyncMock(), asyncio.CancelledError])
+        with (
+            patch("app.consumer.existing_outcome", side_effect=errors.ConnectionFailure) as read,
+            patch("app.consumer.asyncio.sleep") as sleep,
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await self.run_worker(connect)
+        read.assert_awaited_once()
+        sleep.assert_awaited_once()
+        self.assertEqual(connect.await_count, 2)
         self.message.ack.assert_not_awaited()
         self.exchange.publish.assert_not_awaited()
 

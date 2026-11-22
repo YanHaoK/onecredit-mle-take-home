@@ -1,4 +1,9 @@
-"""Consume registry deliveries with manual acknowledgment and bounded retries."""
+"""Consume registry deliveries with manual acknowledgment.
+
+Quarantine invalid events, retry transaction conflicts, and reconnect on transport
+loss. Inference and unexpected database errors stop the worker with the delivery
+unacknowledged. After repair, restart the worker for broker redelivery.
+"""
 
 import asyncio
 from collections.abc import Awaitable, Callable
@@ -11,7 +16,7 @@ from typing import TypeVar
 import aio_pika
 from aio_pika.abc import AbstractExchange, AbstractIncomingMessage
 from pamqp.commands import Basic
-from psycopg import AsyncConnection, Error as DatabaseError
+from psycopg import AsyncConnection, OperationalError, errors
 
 from app.config import MODEL_NAME, Settings
 from app.embeddings import Embedder
@@ -24,16 +29,15 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
-async def retry(
+async def retry_transaction(
     action: Callable[[], Awaitable[T]],
-    errors: tuple[type[Exception], ...],
     operation: str,
     message_id: str | None,
 ) -> T:
     for attempt in range(1, 4):
         try:
             return await action()
-        except errors as exc:
+        except (errors.DeadlockDetected, errors.SerializationFailure, errors.LockNotAvailable) as exc:
             log.warning(
                 "delivery_error operation=%s message_id=%s attempt=%s error=%s",
                 operation, message_id, attempt, type(exc).__name__,
@@ -46,15 +50,11 @@ async def retry(
 
 async def quarantine(
     exchange: AbstractExchange, message: AbstractIncomingMessage, reason: str,
-    *, model_name: str | None = None,
 ) -> None:
-    headers = {"reason": reason}
-    if model_name:
-        headers["model_name"] = model_name
     confirmation = await exchange.publish(
         aio_pika.Message(
             message.body, content_type=message.content_type,
-            message_id=message.message_id, headers=headers,
+            message_id=message.message_id, headers={"reason": reason},
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
         ),
         routing_key=QUARANTINE_QUEUE,
@@ -80,28 +80,22 @@ async def process_delivery(
         await quarantine(exchange, message, str(exc))
         return
 
-    outcome = await retry(
+    outcome = await retry_transaction(
         partial(existing_outcome, database, event, message_id),
-        (DatabaseError,), "read_version", message_id,
+        "read_version", message_id,
     )
     if outcome is None:
         vector = None
         if (description := event.embedding_text) is not None:
             try:
-                vector = await retry(
-                    partial(asyncio.to_thread, embedder.encode, description),
-                    (Exception,), "embed", message_id,
-                )
+                vector = await asyncio.to_thread(embedder.encode, description)
             except Exception as exc:
-                await quarantine(
-                    exchange, message, f"embedding_failed:{type(exc).__name__}",
-                    model_name=MODEL_NAME,
-                )
-                return
+                # Keep even an inference I/O error outside the transport reconnect path.
+                raise RuntimeError(f"inference failed: message_id={message_id} model={MODEL_NAME}") from exc
 
-        outcome = await retry(
+        outcome = await retry_transaction(
             partial(store_event, database, event, message_id, vector),
-            (DatabaseError,), "write_version", message_id,
+            "write_version", message_id,
         )
 
     # store_event returns after its transaction has committed. A failed ACK
@@ -116,6 +110,7 @@ async def process_delivery(
 async def consume(settings: Settings, embedder: Embedder) -> None:
     delay = 1
     while True:
+        database = None
         try:
             async with await connect(settings.database_url) as database:
                 async with await aio_pika.connect(settings.rabbitmq_url, timeout=5) as broker:
@@ -130,9 +125,17 @@ async def consume(settings: Settings, embedder: Embedder) -> None:
                             delay = 1
                     raise ConnectionError("source delivery stream closed")
         except (
-            DatabaseError, aio_pika.exceptions.AMQPException,
-            aio_pika.exceptions.ChannelInvalidStateError, OSError,
+            OperationalError, aio_pika.exceptions.AMQPException,
+            aio_pika.exceptions.ChannelInvalidStateError, ConnectionError, TimeoutError,
         ) as exc:
+            if isinstance(exc, OperationalError):
+                # libpq can report a lost socket without a server SQLSTATE.
+                unavailable = isinstance(exc, (
+                    errors.ConnectionFailure, errors.ConnectionDoesNotExist,
+                    errors.AdminShutdown, errors.CrashShutdown, errors.CannotConnectNow,
+                )) or (exc.sqlstate is None and (database is None or database.broken))
+                if not unavailable:
+                    raise
             # Closing the channel releases any unacknowledged delivery before
             # the next session. Back off before reopening broker consumption.
             log.warning("reconnecting error=%s delay=%s", type(exc).__name__, delay)

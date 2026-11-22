@@ -119,15 +119,18 @@ Use an open-source embedding model that runs on a laptop CPU. Don't call a paid 
 
 ## Getting started
 
-You need Docker, [uv](https://docs.astral.sh/uv/) (it installs Python 3.14 for you) and
-[just](https://github.com/casey/just). Setup takes about 5 minutes and doesn't count towards your time.
+You need Docker and [uv](https://docs.astral.sh/uv/) (it installs Python 3.14 for you).
+[Just](https://github.com/casey/just) provides shortcuts for the commands below.
 
 ```bash
-just setup      # install the producer's dependencies
+just setup      # install the project dependencies
 just up         # start Postgres (with pgvector) and RabbitMQ
 just publish    # publish the registry feed to the queue
 just down       # stop everything and delete the data
 ```
+
+Without `just`, the equivalent commands are `uv sync --locked`, `docker compose up -d --wait`,
+`uv run python -m producer.publish`, and `docker compose down -v`, respectively.
 
 Postgres is at `postgresql://postgres:postgres@localhost:5432/companies`, and the RabbitMQ management UI is at
 http://localhost:15672 (user `guest`, password `guest`). If those ports are taken on your machine, export
@@ -137,7 +140,59 @@ http://localhost:15672 (user `guest`, password `guest`). If those ports are take
 `just publish` sends the whole feed every time you run it. To start again from an empty queue and database, run
 `just down` and then `just up`.
 
-## What's already here
+## Run the ingestion worker
+
+After `just setup` and `just up`, start the worker in a separate terminal:
+
+```bash
+uv run --locked python -m app.consumer
+```
+
+Run `just publish` to send the feed. The worker downloads the pinned multilingual E5 model on its first start and
+reuses the Hugging Face cache on subsequent starts. Once cached, set `HF_HUB_OFFLINE=1` to run without network
+access to the model registry. You can set `HF_HOME` to choose the cache location.
+
+The worker uses the same `POSTGRES_PORT` and `RABBITMQ_PORT` overrides as Compose. `DATABASE_URL` and
+`RABBITMQ_URL` take precedence when set. Compose initializes pgvector and the schema on an empty PostgreSQL
+volume. For an existing local database, apply `sql/001_init.sql` with `psql` before starting the worker.
+
+Valid deliveries update the company and its embedding in one transaction. Malformed deliveries are published to
+`company-events.dlq`, and replay quarantines them again. PostgreSQL and RabbitMQ data survive container recreation
+with their named volumes. `just down` removes those volumes.
+
+## Run the recommendation API
+
+With PostgreSQL running, start the API in a separate terminal:
+
+```bash
+uv run --locked uvicorn app.api:app
+curl "http://127.0.0.1:8000/companies/SYN-001777/similar?limit=5"
+```
+
+`GET /healthz` reports process liveness. The recommendation route accepts limits from 1 to 20 and returns
+semantic matches first. It adds an industry bonus of 0.05 by default. Set `INDUSTRY_BONUS` before starting
+the API to adjust the weight, or pass `ranking=cosine` to use zero bonus for one request. If there are slots
+left, the API fills them with same-industry matches and returns null scores for those cards.
+
+## Run the tests
+
+```bash
+uv run --locked python -m unittest discover -s tests -v
+```
+
+Set `ONECREDIT_TEST_DATABASE_URL` to the connection string for an isolated PostgreSQL database initialized
+with `sql/001_init.sql` to enable the pgvector integration tests. They insert and clean up their own fixtures
+and cover ranking, concurrent version writes, rollback, and retry after a simulated acknowledgment failure.
+
+Local verification with Python 3.14, Docker Compose, and the pinned E5 CPU model processed all 2,518 feed
+deliveries, stored 2,000 companies and 1,961 current embeddings, and quarantined 89 malformed deliveries.
+Replaying the feed preserved every company and embedding row and the top-five API response for
+`SYN-001777`. The API returned HTTP 503 during a PostgreSQL outage and resumed serving recommendations
+after recovery. The worker processed the retained delivery after PostgreSQL came back and resumed
+after a RabbitMQ restart. A queued delivery and a quarantined message survived RabbitMQ container recreation,
+and the restarted worker drained the source queue. See [DESIGN.md](DESIGN.md) for the design and trade-offs.
+
+## Scaffold files
 
 ```
 .

@@ -3,6 +3,7 @@ import json
 import unittest
 
 from app.events import InvalidEvent, parse_event
+from app.api import Recommendation
 
 
 class RegistryEvents(unittest.TestCase):
@@ -39,6 +40,25 @@ class RegistryEvents(unittest.TestCase):
                 event = self.parse()
                 self.assertIsNone(event.embedding_text)
                 self.assertIsNone(event.industry_key)
+
+    def test_repeated_phrase_is_cleaned_for_embedding_and_card(self):
+        phrase = "Ladang kelapa sawit dan pembekalan buah tandan segar"
+        repeated = "\n".join([phrase] * 60)
+        for raw, expected in (
+            (repeated, phrase),
+            (repeated + " dan eksport", repeated + " dan eksport"),
+            (f"{phrase} {phrase}", f"{phrase} {phrase}"),
+        ):
+            with self.subTest(expected=expected):
+                self.event["data"]["natureOfBusiness"] = raw
+                event = self.parse()
+                self.assertEqual(event.nature_of_business, raw)
+                self.assertEqual(event.embedding_text, expected)
+                card = Recommendation(registration_number=event.registration_number,
+                                      company_name=event.company_name, industry=None, state=None,
+                                      nature_of_business=raw, match_type="semantic",
+                                      cosine_similarity=1.0, ranking_score=1.0)
+                self.assertEqual(card.nature_of_business, expected)
 
     def test_invalid_envelopes_and_field_types(self):
         invalid = [

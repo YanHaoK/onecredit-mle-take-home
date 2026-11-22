@@ -31,6 +31,20 @@ def registration_key(value: str) -> str:
     return value.strip().upper()
 
 
+def display_description(value: str | None) -> str | None:
+    """Collapse a whole multiword phrase copied at least three times."""
+    if not value:
+        return value
+    words = value.split()
+    for width in range(1, len(words) // 3 + 1):
+        if len(words) % width or words[width] != words[0]:
+            continue
+        phrase = words[:width]
+        if phrase * (len(words) // width) == words:
+            return " ".join(phrase) if width > 1 else value
+    return value
+
+
 @dataclass(frozen=True)
 class CompanyEvent:
     registration_number: str
@@ -46,7 +60,7 @@ class CompanyEvent:
 
     @property
     def embedding_text(self) -> str | None:
-        return (self.nature_of_business or "").strip() or None
+        return (display_description(self.nature_of_business) or "").strip() or None
 
 
 def parse_event(body: bytes) -> CompanyEvent:

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 
 class InvalidEvent(ValueError):
-    """A delivery that cannot be processed as a company upsert."""
+    """A delivery that cannot be processed as a registry event."""
 
 
 def read_text(
@@ -63,16 +63,22 @@ class CompanyEvent:
         return (display_description(self.nature_of_business) or "").strip() or None
 
 
-def parse_event(body: bytes) -> CompanyEvent:
+@dataclass(frozen=True)
+class StrikeOff:
+    registration_number: str
+    updated_at: datetime
+
+
+def parse_event(body: bytes) -> CompanyEvent | StrikeOff:
     try:
         payload = json.loads(body.decode("utf-8"))
     except (ValueError, RecursionError) as exc:
         raise InvalidEvent("invalid UTF-8 JSON body") from exc
 
-    if not isinstance(payload, dict) or payload.get("type") != "company-upserted":
-        raise InvalidEvent("expected a company-upserted event")
+    if not isinstance(payload, dict) or payload.get("type") not in ("company-upserted", "company-struck-off"):
+        raise InvalidEvent("expected a company upsert or strike-off")
     data = payload.get("data")
-    if not isinstance(data, dict):
+    if payload["type"] == "company-upserted" and not isinstance(data, dict):
         raise InvalidEvent("data must be an object")
 
     raw_timestamp = payload.get("updatedAt")
@@ -86,9 +92,12 @@ def parse_event(body: bytes) -> CompanyEvent:
     except (ValueError, OverflowError) as exc:
         raise InvalidEvent("updatedAt must be a timezone-aware ISO timestamp") from exc
 
-    registration_number = read_text(payload, "registrationNumber", required=True)
+    registration_number = registration_key(read_text(payload, "registrationNumber", required=True))
+    if payload["type"] == "company-struck-off":
+        return StrikeOff(registration_number, updated_at)
+
     return CompanyEvent(
-        registration_number=registration_key(registration_number),
+        registration_number=registration_number,
         updated_at=updated_at,
         company_name=read_text(data, "companyName", required=True),
         nature_of_business=read_text(data, "natureOfBusiness"),

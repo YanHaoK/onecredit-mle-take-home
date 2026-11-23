@@ -43,6 +43,7 @@ class PostgresRanking(unittest.TestCase):
             ("TEST-D", "food", 1.0, "different-model"),
             ("TEST-E", None, None, None),
             ("TEST-F", "food", 0.88, MODEL_NAME),
+            ("TEST-INACTIVE", "food", 1.0, MODEL_NAME),
         ]
         ids = [fixture[0] for fixture in fixtures]
         with psycopg.connect(TEST_URL, autocommit=True) as db:
@@ -68,6 +69,8 @@ class PostgresRanking(unittest.TestCase):
                             """,
                             (vector, model, registration),
                         )
+                # Even an inactive row with an otherwise eligible vector must stay hidden.
+                db.execute("UPDATE companies SET is_active = FALSE WHERE registration_number = 'TEST-INACTIVE'")
             try:
                 with patch.dict(os.environ, {"DATABASE_URL": TEST_URL, "INDUSTRY_BONUS": "0.05"}):
                     with TestClient(app) as client:
@@ -104,6 +107,9 @@ class PostgresRanking(unittest.TestCase):
             self.assertTrue(all(card["match_type"] == "same_industry" for card in fallback))
             self.assertNotIn(registration, [card["registration_number"] for card in fallback])
         self.assertEqual(client.get("/companies/TEST-E/similar").json()["recommendations"], [])
+        inactive = client.get("/companies/TEST-INACTIVE/similar")
+        self.assertEqual(inactive.status_code, 200)
+        self.assertEqual(inactive.json()["recommendations"], [])
         missing = client.get("/companies/TEST-MISSING/similar")
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(missing.json()["detail"]["code"], "COMPANY_NOT_FOUND")

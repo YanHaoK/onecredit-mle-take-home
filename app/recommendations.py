@@ -7,7 +7,7 @@ from app.config import MODEL_NAME
 
 RECOMMENDATIONS = """
     WITH query_company AS (
-        SELECT c.registration_number, c.industry_key, e.embedding
+        SELECT c.registration_number, c.industry_key, c.is_active, e.embedding
         FROM companies c
         LEFT JOIN company_embeddings e
           ON e.registration_number = c.registration_number
@@ -27,7 +27,7 @@ RECOMMENDATIONS = """
         JOIN companies c
           ON c.registration_number = e.registration_number
          AND c.updated_at = e.source_updated_at
-        WHERE q.embedding IS NOT NULL
+        WHERE q.is_active AND c.is_active AND q.embedding IS NOT NULL
     ), semantic AS (
         SELECT registration_number, company_name, industry, state, nature_of_business,
                'semantic' AS match_type, cosine_similarity,
@@ -42,7 +42,7 @@ RECOMMENDATIONS = """
                NULL::double precision AS ranking_score, 1 AS tier
         FROM query_company q
         JOIN companies c ON c.industry_key = q.industry_key
-        WHERE c.registration_number <> q.registration_number
+        WHERE q.is_active AND c.is_active AND c.registration_number <> q.registration_number
           AND NOT EXISTS (
               SELECT 1 FROM semantic s WHERE s.registration_number = c.registration_number
           )

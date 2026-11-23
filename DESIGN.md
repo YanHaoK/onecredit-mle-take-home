@@ -39,13 +39,13 @@ validation and version rules. Company counts refer to the 2,000 latest accepted 
 | 24 descriptions are null and 15 are empty. Industry is missing for 102 companies and state for 49. | Keep the company. A missing description clears its vector. A known industry provides fallback cards. Missing state stays null. Four companies lack both description and industry, leaving them with no way to receive or appear in recommendations. |
 | 49 valid deliveries had registration-number formatting variants. In delivery order, 63 valid events duplicated the current version and 66 were stale. | Trim and uppercase the ID. Update the stored company only when the source timestamp is newer. |
 | 30 names each appear under two registration numbers, and one name appears under three. Among 1,961 companies with usable descriptions there are 169 distinct cleaned texts. | Keep each registration number as a separate company, even when names or business descriptions match. |
-| 89 deliveries failed validation. | Quarantine the original delivery with its reason. The first reported failures were 51 timestamps, 10 registration numbers, nine data objects, five invalid JSON bodies, six null envelopes, and eight unsupported struck-off events. |
+| 81 deliveries failed validation. | Quarantine the original delivery with its reason. The first reported failures were 51 timestamps, 10 registration numbers, nine data objects, five invalid JSON bodies, and six null envelopes. |
 
-**Company status decision.** For this take-home, the worker quarantines every `company-struck-off` event in
-`company-events.dlq` for manual review. Only an accepted `company-upserted` event updates a company's
-stored record and embedding. The feed contains eight struck-off events that arrived with newer source
-timestamps than the last accepted upserts. All eight companies therefore keep their existing embeddings
-and remain eligible for recommendations. The portal's eligibility policy can be revisited with the registry.
+**Company status.** A newer `company-struck-off` marks the company inactive and removes its embedding in
+one transaction. The row retains its last known profile. If the strike-off arrives first, the worker stores
+the registration number and source timestamp so a late, older upsert cannot reopen the company.
+A strictly newer upsert reactivates it. Equal timestamps follow the existing first-committed rule.
+An inactive company's page receives an empty panel, and both ranking paths exclude it from other panels.
 
 **Open location finding.** State capitalization varies for 313 records. The API preserves these spellings.
 Some descriptions mention a city in a different state from the state field. Registered address and operating
@@ -69,9 +69,9 @@ The FastAPI service exposes GET /companies/{registration_number}/similar for rec
 
 ## Verification
 
-- **Automated tests:** All 13 tests passed, covering event validation, recommendation ranking, concurrent updates, transaction rollback, and message acknowledgment behavior.
+- All 20 tests passed against an isolated pgvector database, including strike-off redelivery, reactivation, ranking, concurrent updates, rollback, and acknowledgment handling.
 
-- **End-to-end ingestion:** Processed 2,518 events from the supplied producer, resulting in 2,000 companies, 1,961 embeddings, and 89 quarantined events. Replaying the dataset did not change the stored company or embedding records.
+- Two passes through RabbitMQ with the pinned E5 encoder produced identical company and embedding rows. Each pass processed 2,518 deliveries and sent 81 to quarantine. PostgreSQL retained 2,000 companies, including 1,992 active companies and 1,953 current embeddings. All eight struck-off companies returned empty panels.
 
 - **Failure recovery:** Verified that stale updates cannot overwrite newer records, missing descriptions remove existing embeddings, and the service handles PostgreSQL and RabbitMQ outages. Queued messages and quarantined events also survived broker container recreation.
 

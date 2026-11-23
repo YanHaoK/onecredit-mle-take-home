@@ -20,7 +20,7 @@ from psycopg import AsyncConnection, OperationalError, errors
 
 from app.config import MODEL_NAME, Settings
 from app.embeddings import Embedder
-from app.events import InvalidEvent, parse_event
+from app.events import CompanyEvent, InvalidEvent, parse_event
 from app.repository import connect, existing_outcome, store_event
 
 SOURCE_QUEUE = "company-events"
@@ -86,7 +86,7 @@ async def process_delivery(
     )
     if outcome is None:
         vector = None
-        if (description := event.embedding_text) is not None:
+        if isinstance(event, CompanyEvent) and (description := event.embedding_text) is not None:
             try:
                 vector = await asyncio.to_thread(embedder.encode, description)
             except Exception as exc:

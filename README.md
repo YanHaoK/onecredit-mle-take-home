@@ -174,7 +174,7 @@ Use an open-source embedding model that runs on a laptop CPU. Don't call a paid 
 ## Local configuration
 
 - **Ports.** Set `POSTGRES_PORT`, `RABBITMQ_PORT`, or `RABBITMQ_UI_PORT` in both terminals before startup to override the defaults. The default database URL is `postgresql://postgres:postgres@localhost:5432/companies`. The [RabbitMQ management UI](http://localhost:15672) uses `guest` for both username and password. Explicit `DATABASE_URL` and `RABBITMQ_URL` settings take precedence for the Python services that use them.
-- **Model cache.** The worker reuses the downloaded multilingual E5 model. Set `HF_HOME` to choose the cache location or `HF_HUB_OFFLINE=1` to use a populated cache offline.
+- **Model cache.** The worker downloads the pinned multilingual MiniLM model on first use. Set `HF_HOME` to choose the cache location or `HF_HUB_OFFLINE=1` to use a populated cache offline. When switching from E5, follow the fresh-database steps below and republish the feed. Replaying events into an existing database skips previously accepted versions, leaving their old vectors in place.
 - **Fresh database.** Compose applies [the schema](sql/001_init.sql) when it creates the Postgres volume. To pick up a schema change, stop the worker and API, then run `just down`. **This deletes the local database and RabbitMQ queues, including quarantined messages.** Repeat steps 2 through 5 to start fresh and reload the feed.
 
 ## Recommendation API
@@ -190,6 +190,8 @@ Both paths exclude struck-off companies. A request for a known inactive company 
 ```bash
 uv run --locked python -m unittest discover -s tests -v
 ```
+
+Set `ONECREDIT_TEST_MODEL=1` to include the English–Malay retrieval check using the actual MiniLM encoder.
 
 Set `ONECREDIT_TEST_DATABASE_URL` to the connection string for an isolated PostgreSQL database initialized
 with `sql/001_init.sql` to enable the pgvector integration tests. They insert and clean up their own fixtures

@@ -1,4 +1,4 @@
-"""Encode business descriptions with the pinned E5 CPU model."""
+"""Encode business descriptions with the pinned multilingual MiniLM CPU model."""
 
 import numpy as np
 import onnxruntime as ort
@@ -13,13 +13,13 @@ DIMENSION = 384
 class Embedder:
     def __init__(self) -> None:
         tokenizer_file = hf_hub_download(
-            MODEL_REPO, "onnx/tokenizer.json", revision=MODEL_REVISION
+            MODEL_REPO, "tokenizer.json", revision=MODEL_REVISION
         )
         model_file = hf_hub_download(
-            MODEL_REPO, "onnx/model.onnx", revision=MODEL_REVISION
+            MODEL_REPO, "model_optimized.onnx", revision=MODEL_REVISION
         )
         self.tokenizer = Tokenizer.from_file(tokenizer_file)
-        self.tokenizer.enable_truncation(max_length=512)
+        self.tokenizer.enable_truncation(max_length=128)
         options = ort.SessionOptions()
         options.intra_op_num_threads = 2
         self.session = ort.InferenceSession(
@@ -28,9 +28,7 @@ class Embedder:
         self.input_names = [item.name for item in self.session.get_inputs()]
 
     def encode(self, text: str) -> list[float]:
-        # The same prefix puts both sides of company-to-company comparisons
-        # through the model's symmetric similarity preprocessing.
-        tokens = self.tokenizer.encode(f"query: {text}")
+        tokens = self.tokenizer.encode(text)
         inputs = {
             "input_ids": np.array([tokens.ids], dtype=np.int64),
             "attention_mask": np.array([tokens.attention_mask], dtype=np.int64),
@@ -43,5 +41,5 @@ class Embedder:
         vector = hidden[0, mask].mean(axis=0)
         norm = np.linalg.norm(vector)
         if vector.shape != (DIMENSION,) or not np.isfinite(norm) or norm == 0:
-            raise ValueError("invalid E5 embedding")
+            raise ValueError("invalid MiniLM embedding")
         return (vector / norm).tolist()

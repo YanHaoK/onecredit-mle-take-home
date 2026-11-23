@@ -4,9 +4,9 @@ import math
 import os
 from dataclasses import dataclass
 
-MODEL_REPO = "intfloat/multilingual-e5-small"
-MODEL_REVISION = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
-MODEL_NAME = f"{MODEL_REPO}@{MODEL_REVISION}:onnx-query-mean-l2"
+MODEL_REPO = "Qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q"
+MODEL_REVISION = "faf4aa4225822f3bc6376869cb1164e8e3feedd0"
+MODEL_NAME = f"{MODEL_REPO}@{MODEL_REVISION}:onnx-128-mean-l2"
 
 
 @dataclass(frozen=True)

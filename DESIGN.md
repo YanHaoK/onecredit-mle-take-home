@@ -53,7 +53,11 @@ location can differ, so the feed alone does not justify a correction.
 
 ## Model and ranking
 
-The service uses the MIT-licensed intfloat/multilingual-e5-small model with ONNX Runtime for CPU inference. I chose a multilingual model to support both English and Malay business descriptions without translation. Each description is converted into a 384-dimensional embedding, with model and preprocessing versions stored to maintain consistency.
+The worker uses the quantized ONNX export of `paraphrase-multilingual-MiniLM-L12-v2` on CPU. It tokenizes the business description directly, limits input to 128 tokens, mean-pools the token representations and normalizes the resulting 384-dimensional vector. Each vector records the model revision and preprocessing version.
+
+Model selection used 12 English–Malay pairs from the synthetic feed. Searching across all 169 distinct descriptions and excluding the query text, MiniLM ranked the designated counterpart first for all 12 activities in both directions. E5 did so for five English queries and two Malay queries. For example, for a Malay rubber-glove manufacturer, E5's highest-ranked distinct description with the default industry bonus described rubberwood furniture. MiniLM returned rubber-glove production in English. With duplicate descriptions included, both models filled all five cards with copies of the query text on these 12 cases. The comparison supports bilingual matching when exact copies are absent.
+
+On the default five-card route, the Malay mobile-phone retailer in Ipoh (`SYN-000208`) illustrates a visible change. E5 ranked a Malay description of a phone retailer in Seremban first. MiniLM ranked an English description of a phone retailer in Ipoh first (`SYN-001876`). Both candidates sell the same goods. MiniLM also matched the city across languages using the business description.
 
 Recommendations are ranked using exact cosine similarity in PostgreSQL, with a configurable same-industry bonus (default 0.05). Only the business description is embedded, while industry acts as an additional ranking signal. This allows companies with similar business activities to rank highly even when they belong to different industries.
 
@@ -69,9 +73,9 @@ The FastAPI service exposes GET /companies/{registration_number}/similar for rec
 
 ## Verification
 
-- All 20 tests passed against an isolated pgvector database, including strike-off redelivery, reactivation, ranking, concurrent updates, rollback, and acknowledgment handling.
+- All 21 tests passed with the pinned MiniLM model and an isolated pgvector database, including bilingual retrieval, strike-off redelivery, reactivation, ranking, concurrent updates, rollback, and acknowledgment handling.
 
-- Two passes through RabbitMQ with the pinned E5 encoder produced identical company and embedding rows. Each pass processed 2,518 deliveries and sent 81 to quarantine. PostgreSQL retained 2,000 companies, including 1,992 active companies and 1,953 current embeddings. All eight struck-off companies returned empty panels.
+- Two passes through RabbitMQ with MiniLM produced identical company and embedding rows. Each pass processed 2,518 deliveries and sent 81 to quarantine. PostgreSQL retained 2,000 companies, including 1,992 active companies and 1,953 MiniLM embeddings. All eight struck-off companies returned empty panels.
 
 - **Failure recovery:** Verified that stale updates cannot overwrite newer records, missing descriptions remove existing embeddings, and the service handles PostgreSQL and RabbitMQ outages. Queued messages and quarantined events also survived broker container recreation.
 

@@ -4,7 +4,8 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS companies (
     registration_number TEXT PRIMARY KEY,
-    company_name TEXT NOT NULL,
+    company_name TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
     nature_of_business TEXT,
     industry TEXT,
     industry_key TEXT,
@@ -12,7 +13,9 @@ CREATE TABLE IF NOT EXISTS companies (
     updated_at TIMESTAMPTZ NOT NULL,
     source_message_id TEXT,
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (registration_number, updated_at)
+    UNIQUE (registration_number, updated_at),
+    -- A strike-off can arrive before the first company profile.
+    CHECK (NOT is_active OR company_name IS NOT NULL)
 );
 
 CREATE TABLE IF NOT EXISTS company_embeddings (

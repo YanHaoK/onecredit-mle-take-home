@@ -175,8 +175,7 @@ Use an open-source embedding model that runs on a laptop CPU. Don't call a paid 
 
 - **Ports.** Set `POSTGRES_PORT`, `RABBITMQ_PORT`, or `RABBITMQ_UI_PORT` in both terminals before startup to override the defaults. The default database URL is `postgresql://postgres:postgres@localhost:5432/companies`. The [RabbitMQ management UI](http://localhost:15672) uses `guest` for both username and password. Explicit `DATABASE_URL` and `RABBITMQ_URL` settings take precedence for the Python services that use them.
 - **Model cache.** The worker reuses the downloaded multilingual E5 model. Set `HF_HOME` to choose the cache location or `HF_HUB_OFFLINE=1` to use a populated cache offline.
-- **Existing databases.** Compose initializes the schema on an empty Postgres volume. For an existing database, apply [the schema](sql/001_init.sql) with `psql` before starting the worker.
-- **Full reset.** To rebuild old embeddings after the description cleanup, stop the worker and API, then run `just down`. **This deletes the local database and RabbitMQ queues, including quarantined messages.** Repeat steps 2 through 5 to rebuild from the feed. Replaying alone skips previously accepted versions and quarantines malformed deliveries again.
+- **Fresh database.** Compose applies [the schema](sql/001_init.sql) when it creates the Postgres volume. To pick up a schema change, stop the worker and API, then run `just down`. **This deletes the local database and RabbitMQ queues, including quarantined messages.** Repeat steps 2 through 5 to start fresh and reload the feed.
 
 ## Recommendation API
 
@@ -184,6 +183,7 @@ Use an open-source embedding model that runs on a laptop CPU. Don't call a paid 
 semantic matches first. It adds an industry bonus of 0.05 by default. Set `INDUSTRY_BONUS` before starting
 the API to adjust the weight, or pass `ranking=cosine` to use zero bonus for one request. If there are slots
 left, the API fills them with same-industry matches and returns null scores for those cards.
+Both paths exclude struck-off companies. A request for a known inactive company returns HTTP 200 with an empty recommendations list.
 
 ## Run the tests
 
@@ -195,10 +195,9 @@ Set `ONECREDIT_TEST_DATABASE_URL` to the connection string for an isolated Postg
 with `sql/001_init.sql` to enable the pgvector integration tests. They insert and clean up their own fixtures
 and cover ranking, concurrent version writes, rollback, and retry after a simulated acknowledgment failure.
 
-Local verification with Python 3.14, Docker Compose, and the pinned E5 CPU model processed all 2,518 feed
-deliveries, stored 2,000 companies and 1,961 current embeddings, and quarantined 89 malformed deliveries.
-Replaying the feed preserved every company and embedding row and the top-five API response for
-`SYN-001777`. The API returned HTTP 503 during a PostgreSQL outage and resumed serving recommendations
+After all 2,518 deliveries, the expected totals are 2,000 retained companies, including 1,992 active and eight
+struck off, 1,953 current embeddings, and 81 quarantined deliveries per pass.
+In earlier outage checks, the API returned HTTP 503 during a PostgreSQL outage and resumed serving recommendations
 after recovery. The worker processed the retained delivery after PostgreSQL came back and resumed
 after a RabbitMQ restart. A queued delivery and a quarantined message survived RabbitMQ container recreation,
 and the restarted worker drained the source queue. See [DESIGN.md](DESIGN.md) for the design and trade-offs.
